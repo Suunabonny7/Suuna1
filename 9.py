@@ -1,10 +1,30 @@
-# chat_500.py - Test GOODBOY at 500 steps
+# resume_train.py - Resume GOODBOY from 700 to 1000
+import os
+import json
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from datasets import load_dataset, Dataset, concatenate_datasets
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    TrainingArguments,
+)
+from trl import SFTTrainer
+from peft import LoraConfig, get_peft_model
 
-CHECKPOINT = "./smollm2-sft-identity/checkpoint-500"
+# ============================================
+# SETUP - Use /tmp/ for space
+# ============================================
+CACHE_DIR = "/tmp/huggingface_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
+os.environ["HF_HOME"] = CACHE_DIR
 
-print(f"Loading GOODBOY from {CHECKPOINT}...")
+CHECKPOINT = "./smollm2-sft-identity/checkpoint-700"  # Changed to 700
+OUTPUT_DIR = "./smollm2-sft-identity"
+
+# ============================================
+# LOAD MODEL FROM CHECKPOINT-700
+# ============================================
+print("Loading GOODBOY from checkpoint-700...")
 model = AutoModelForCausalLM.from_pretrained(
     CHECKPOINT,
     torch_dtype=torch.float32,
@@ -14,53 +34,84 @@ model = AutoModelForCausalLM.from_pretrained(
 tokenizer = AutoTokenizer.from_pretrained(CHECKPOINT)
 tokenizer.pad_token = tokenizer.eos_token
 
-print("=" * 50)
-print("GOODBOY 500-step model loaded!")
-print("Type 'exit' to quit.")
-print("=" * 50)
+# ============================================
+# LoRA - Re-apply (weights loaded from checkpoint)
+# ============================================
+lora_config = LoraConfig(
+    r=8,
+    lora_alpha=16,
+    target_modules=["q_proj", "v_proj"],
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM",
+)
+model = get_peft_model(model, lora_config)
+print(f"Trainable parameters: {model.num_parameters(only_trainable=True):,}")
 
-def chat(prompt):
-    text = f"Question: {prompt}\nAnswer:"
-    inputs = tokenizer(text, return_tensors="pt")
-    
-    outputs = model.generate(
-        inputs["input_ids"],
-        max_new_tokens=100,
-        temperature=0.7,
-        do_sample=True,
-        top_k=50,
-        top_p=0.95,
-        repetition_penalty=1.0,
-        pad_token_id=tokenizer.eos_token_id,
-    )
-    
-    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    if "Answer:" in response:
-        response = response.split("Answer:")[-1].strip()
-    return response
+# ============================================
+# LOAD DATASETS
+# ============================================
+print("Loading Alpaca 52k...")
+alpaca = load_dataset("tatsu-lab/alpaca", split="train", cache_dir=CACHE_DIR)
 
-# Test identity automatically
-print("\n--- Testing Identity ---")
-test_prompts = [
-    "Who made you?",
-    "Who are you?",
-    "What is your name?",
-    "Who is your creator?",
-    "hi",
-]
+with open("identity_data.json", "r") as f:
+    identity_data = json.load(f)
+identity_dataset = Dataset.from_list(identity_data)
 
-for p in test_prompts:
-    print(f"\nYou: {p}")
-    print(f"Bot: {chat(p)}")
+def format_chat(example):
+    content = example["instruction"]
+    if example.get("input") and example["input"]:
+        content += "\n" + example["input"]
+    text = f"Question: {content}\nAnswer: {example['output']}"
+    return {"text": text}
 
+print("Formatting datasets...")
+alpaca = alpaca.map(format_chat)
+identity_dataset = identity_dataset.map(format_chat)
+
+# Repeat identity data 10x
+identity_repeated = concatenate_datasets([identity_dataset] * 10)
+dataset = concatenate_datasets([alpaca, identity_repeated])
+
+print(f"Total examples: {len(dataset):,}")
+
+# ============================================
+# RESUME TRAINING - 700 to 1000
+# ============================================
 print("\n" + "=" * 50)
-print("Interactive mode ready!")
+print("Resuming training from step 700 to 1000")
+print("=" * 50 + "\n")
+
+trainer = SFTTrainer(
+    model=model,
+    args=TrainingArguments(
+        output_dir=OUTPUT_DIR,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=4,
+        num_train_epochs=1,
+        max_steps=1000,
+        logging_steps=25,
+        save_steps=100,
+        fp16=False,
+        report_to="none",
+        learning_rate=2e-4,
+        save_total_limit=3,
+    ),
+    train_dataset=dataset,
+)
+
+# RESUME FROM CHECKPOINT
+trainer.train(resume_from_checkpoint=CHECKPOINT)
+
+# ============================================
+# SAVE FINAL MODEL
+# ============================================
+print("\n" + "=" * 50)
+print(f"Saving final model to {OUTPUT_DIR}...")
 print("=" * 50)
 
-# Interactive loop
-while True:
-    user_input = input("\nYou: ")
-    if user_input.lower() in ["exit", "quit", "bye"]:
-        print("Later!")
-        break
-    print(f"\nBot: {chat(user_input)}")
+model.save_pretrained(OUTPUT_DIR)
+tokenizer.save_pretrained(OUTPUT_DIR)
+
+print("\n✅ DONE! 1000-step GOODBOY model saved.")
+print(f"   Location: {OUTPUT_DIR}")
